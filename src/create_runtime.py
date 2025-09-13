@@ -2,7 +2,7 @@ import boto3, json
 from botocore.exceptions import ClientError
 
 REGION = "us-east-1"
-IMAGE_URI = "175573404892.dkr.ecr.us-east-1.amazonaws.com/agentcore-poc:latest"
+IMAGE_URI = "175573404892.dkr.ecr.us-east-1.amazonaws.com/agentcore-poc:v1"
 ROLE_ARN = "arn:aws:iam::175573404892:role/AgentCoreRuntimeRole"
 
 client = boto3.client("bedrock-agentcore-control", region_name=REGION)
