@@ -25,3 +25,11 @@ curl http://localhost:8080/ping
 curl -X POST http://localhost:8080/invocations ^
   -H "Content-Type: application/json" ^
   -d "{\"prompt\":\"hello\"}"
+
+
+
+
+
+# MCP:
+docker buildx build --platform linux/arm64 -f Dockerfile.mcp -t mcp-server:arm64 --load .
+

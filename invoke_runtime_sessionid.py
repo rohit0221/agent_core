@@ -5,13 +5,15 @@ RUNTIME_ARN = "arn:aws:bedrock-agentcore:us-east-1:175573404892:runtime/agentcor
 
 client = boto3.client("bedrock-agentcore", region_name=REGION)
 
+runtimeSessionId = "411ac99e-0690-4d8e-a39a-25ce1dfa60df"
+
+
 resp = client.invoke_agent_runtime(
     agentRuntimeArn=RUNTIME_ARN,
+    runtimeSessionId=runtimeSessionId,   # <-- added
     contentType="application/json",
     accept="application/json",
-    # payload=json.dumps({"inputText": "hello from agentcore"}).encode("utf-8")
-    payload=json.dumps({"prompt": "hello from agentcore"}).encode("utf-8")
-
+    payload=json.dumps({"prompt": "second message in same session"}).encode("utf-8")
 )
 
 print("STATUS:", resp.get("statusCode"))
