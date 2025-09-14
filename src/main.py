@@ -1,43 +1,114 @@
 from fastapi import FastAPI, Request
-from typing import Any, Dict, List
-import os, json, re
-import urllib.parse
-import urllib.request
+from typing import Any, Dict, List, Optional
+import os, json, re, uuid, urllib.parse, urllib.request
+import boto3
+from botocore.exceptions import ClientError, BotoCoreError
 
 app = FastAPI()
 
 # === Config ===
-MCP_BASE_URL = os.getenv("MCP_BASE_URL", "http://localhost:8000")  # your MCP server base
+AWS_REGION = os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1"))
+MCP_RUNTIME_ARN = os.getenv("MCP_RUNTIME_ARN")  # <-- set in AWS runtime env
+if not MCP_RUNTIME_ARN:
+    MCP_BASE_URL = os.getenv("MCP_BASE_URL", "http://localhost:8000")  # local dev
+else:
+    MCP_BASE_URL = None
 
-def http_get_json(url: str) -> Any:
+# Data-plane client (only used if MCP_RUNTIME_ARN is set)
+_bedrock_client = None
+def _client():
+    global _bedrock_client
+    if _bedrock_client is None:
+        _bedrock_client = boto3.client("bedrock-agentcore", region_name=AWS_REGION)
+    return _bedrock_client
+
+# Keep a single MCP session per process
+_mcp_session_id: Optional[str] = None
+
+# -------- True MCP calls via AgentCore data plane --------
+def _mcp_invoke(message: Dict[str, Any]) -> Dict[str, Any]:
+    global _mcp_session_id
+    kwargs = dict(
+        agentRuntimeArn=MCP_RUNTIME_ARN,
+        contentType="application/json",
+        accept="application/json",
+        payload=json.dumps(message).encode("utf-8"),
+    )
+    if _mcp_session_id:
+        kwargs["runtimeSessionId"] = _mcp_session_id
+
+    resp = _client().invoke_agent_runtime(**kwargs)
+    sid = resp.get("runtimeSessionId")
+    if sid:
+        _mcp_session_id = sid
+
+    body_text = resp["response"].read().decode("utf-8")
+    try:
+        return json.loads(body_text)
+    except Exception:
+        return {"_raw": body_text}
+
+def _mcp_call_tool(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    req = {
+        "type": "mcp.tool.call",
+        "id": str(uuid.uuid4()),
+        "tool": tool_name,
+        "arguments": arguments,
+    }
+    try:
+        out = _mcp_invoke(req)
+        if isinstance(out, dict):
+            if "result" in out:
+                return out["result"]
+            if "error" in out:
+                return {"_error": f"MCP error: {out['error']}"}
+            if "data" in out:
+                return out["data"]
+            if "outputs" in out:
+                return out["outputs"]
+            return {"_error": f"Unexpected MCP response: {json.dumps(out)[:300]}"}
+        return {"_error": f"Non-JSON MCP response: {str(out)[:300]}"}
+    except (ClientError, BotoCoreError) as e:
+        return {"_error": f"MCP invoke failed: {type(e).__name__}: {e}"}
+
+# -------- Tool wrappers --------
+def call_order_lookup(order_id: str) -> Dict[str, Any]:
+    if MCP_RUNTIME_ARN:
+        return _mcp_call_tool("order_lookup", {"order_id": order_id})
+    # local HTTP fallback
+    q = urllib.parse.urlencode({"order_id": order_id})
+    url = f"{MCP_BASE_URL}/debug/order_lookup?{q}"
     try:
         with urllib.request.urlopen(url, timeout=5) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except Exception as e:
-        # Return a structured error so the endpoint never crashes
         return {"_error": f"HTTP call failed: {type(e).__name__}: {e}", "_url": url}
 
-def call_order_lookup(order_id: str) -> Dict[str, Any]:
-    q = urllib.parse.urlencode({"order_id": order_id})
-    url = f"{MCP_BASE_URL}/debug/order_lookup?{q}"
-    return http_get_json(url)
-
 def call_kb_search(query: str, top_k: int = 3) -> List[Dict[str, str]]:
+    if MCP_RUNTIME_ARN:
+        out = _mcp_call_tool("kb_search", {"query": query, "top_k": top_k})
+        if isinstance(out, dict) and out.get("_error"):
+            return out
+        return out if isinstance(out, list) else [out]
+    # local HTTP fallback
     q = urllib.parse.urlencode({"query": query, "top_k": str(top_k)})
     url = f"{MCP_BASE_URL}/debug/kb_search?{q}"
-    return http_get_json(url)
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        return {"_error": f"HTTP call failed: {type(e).__name__}: {e}", "_url": url}
 
+# -------- Routing --------
 def route_to_tool(prompt: str) -> Dict[str, Any]:
     p = prompt.strip()
 
-    # order lookup: "order 12345" or "order: 12345"
     m = re.search(r"\border[:\s]+(\d{3,})\b", p, re.IGNORECASE)
     if m:
         order_id = m.group(1)
         data = call_order_lookup(order_id)
         return {"tool": "order_lookup", "args": {"order_id": order_id}, "result": data}
 
-    # kb search: "kb search refund" or "search refund"
     m = re.search(r"\b(?:kb\s+search|search)\s+(.+)", p, re.IGNORECASE)
     if m:
         query = m.group(1).strip()
@@ -46,16 +117,20 @@ def route_to_tool(prompt: str) -> Dict[str, Any]:
 
     return {"tool": None}
 
+# -------- API surface --------
 @app.get("/ping")
 async def ping():
-    return {"status": "healthy", "mcp_base_url": MCP_BASE_URL}
+    return {
+        "status": "healthy",
+        "mode": "MCP" if MCP_RUNTIME_ARN else "HTTP-DEBUG",
+        "mcp_runtime_arn": MCP_RUNTIME_ARN,
+        "region": AWS_REGION,
+    }
 
 @app.post("/invocations")
 async def invocations(request: Request):
     body: Dict[str, Any] = await request.json()
-    prompt = (
-        body.get("prompt") or body.get("input") or body.get("message") or body.get("inputText")
-    )
+    prompt = body.get("prompt") or body.get("input") or body.get("message") or body.get("inputText")
     if not prompt:
         return {"response": "Say: 'order 12345' or 'search refund policy'.", "status": "success"}
 
@@ -65,7 +140,7 @@ async def invocations(request: Request):
         result = routed["result"]
         if isinstance(result, dict) and result.get("_error"):
             return {"response": f"Tool error: {result['_error']}", "tool_call": routed, "status": "error"}
-        if "error" in result:
+        if isinstance(result, dict) and "error" in result:
             reply = f"Order {routed['args']['order_id']} not found."
         else:
             reply = (
@@ -85,5 +160,4 @@ async def invocations(request: Request):
             reply = f"Top matches for '{routed['args']['query']}':\n{bullets}"
         return {"response": reply, "tool_call": routed, "status": "success"}
 
-    # fallback
     return {"response": f"You said: {prompt}", "status": "success"}
